@@ -1,5 +1,7 @@
 import json
 import io
+import time
+import logging
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -10,6 +12,19 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, "app.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Handwriting Reference Extractor", layout="wide")
 
@@ -41,22 +56,38 @@ def normalize_company(raw_text: str) -> str:
 
 
 def process_image(image: Image.Image, api_key: str, model: str = "gemini-2.5-flash"):
-    client = genai.Client(api_key=api_key)
-    prompt = """
-    Analyze this handwritten note carefully. It contains list entries organized under dates (e.g., 29-7, 30-7).
-    Extract each line item into a structured list with these exact keys:
-    1. "date": The section header date (e.g., "29-7", "30-7").
-    2. "reference": The code or alphanumeric reference string on the left side (e.g., "2605NLRRJ6H3", "369701", "BP4Yj").
-    3. "company": The text on the right side if present (e.g., "مع رضا", "مصري", "sun", "Masters"). If blank, use null.
+    logger.info("Starting extraction | model=%s | image_size=%sx%s", model, image.width, image.height)
+    start = time.time()
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = """
+        Analyze this handwritten note carefully. It contains list entries organized under dates (e.g., 29-7, 30-7).
+        Extract each line item into a structured list with these exact keys:
+        1. "date": The section header date (e.g., "29-7", "30-7").
+        2. "reference": The code or alphanumeric reference string on the left side (e.g., "2605NLRRJ6H3", "369701", "BP4Yj").
+        3. "company": The text on the right side if present (e.g., "مع رضا", " المصري", "sun", "Masters"). If blank, use null.
 
-    Respond STRICTLY with a valid JSON array of objects.
-    """
-    response = client.models.generate_content(
-        model=model,
-        contents=[image, prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
-    )
-    raw_data = json.loads(response.text)
+        Respond STRICTLY with a valid JSON array of objects.
+        """
+        response = client.models.generate_content(
+            model=model,
+            contents=[image, prompt],
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
+        )
+        elapsed = time.time() - start
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = getattr(usage, "prompt_token_count", "?") if usage else "?"
+        completion_tokens = getattr(usage, "candidates_token_count", "?") if usage else "?"
+        logger.info(
+            "API response OK | model=%s | time=%.2fs | prompt_tokens=%s | completion_tokens=%s",
+            model, elapsed, prompt_tokens, completion_tokens,
+        )
+        raw_data = json.loads(response.text)
+        logger.info("Parsed %d records from response", len(raw_data))
+    except Exception as e:
+        elapsed = time.time() - start
+        logger.error("API call failed | model=%s | time=%.2fs | error=%s", model, elapsed, str(e))
+        raise
     processed_records = []
     for item in raw_data:
         raw_company = item.get("company")
@@ -97,23 +128,31 @@ if "results" not in st.session_state:
 if uploaded_files:
     if st.button("Extract All Images"):
         if not api_key:
+            logger.warning("Extraction blocked: no API key provided")
             st.error("Please enter your Gemini API Key in the sidebar.")
         else:
             st.session_state.results.clear()
+            logger.info("Batch extraction started | files=%d | model=%s", len(uploaded_files), model)
             progress = st.progress(0, text="Starting extraction...")
             for i, uploaded in enumerate(uploaded_files):
                 progress.progress(
                     i / len(uploaded_files),
                     text=f"Processing {uploaded.name} ({i + 1}/{len(uploaded_files)})...",
                 )
+                logger.info("Processing file %d/%d: %s", i + 1, len(uploaded_files), uploaded.name)
                 image_bytes = uploaded.getvalue()
                 image = Image.open(uploaded)
                 try:
                     df = process_image(image, api_key, model)
                     st.session_state.results[uploaded.name] = {"df": df, "image": image_bytes}
+                    logger.info("Extraction OK | file=%s | rows=%d", uploaded.name, len(df))
                 except Exception as e:
                     st.session_state.results[uploaded.name] = {"df": f"ERROR: {e}", "image": image_bytes}
+                    logger.error("Extraction FAILED | file=%s | error=%s", uploaded.name, str(e))
             progress.progress(1.0, text="Done!")
+            logger.info("Batch extraction complete | total=%d | success=%d",
+                        len(uploaded_files),
+                        sum(1 for v in st.session_state.results.values() if isinstance(v["df"], pd.DataFrame)))
             st.rerun()
 
     if st.session_state.results:
@@ -133,6 +172,7 @@ if uploaded_files:
                     merged = pd.concat(
                         [st.session_state.results[name]["df"] for name in selected], ignore_index=True
                     )
+                    logger.info("Merged %d images | total_rows=%d", len(selected), len(merged))
                     st.download_button(
                         label=f"Download Merged Excel ({len(merged)} rows)",
                         data=to_excel_buffer(merged),
@@ -175,5 +215,6 @@ if uploaded_files:
                         )
 
         if st.button("Clear All Results"):
+            logger.info("Clearing all results | count=%d", len(st.session_state.results))
             st.session_state.results.clear()
             st.rerun()
