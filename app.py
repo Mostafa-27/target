@@ -176,25 +176,12 @@ st.write("Upload one or more images of handwritten reference numbers. Extract, e
 
 with st.sidebar:
     st.header("Configuration")
-    provider = st.radio("Provider", ["Google Gemini", "Ollama Local", "Ollama Cloud"], horizontal=True)
+    provider = st.radio("Provider", ["Google Gemini", "Ollama Cloud"], horizontal=True)
 
     if provider == "Google Gemini":
         api_key = st.text_input("Gemini API Key", type="password", value=os.getenv("GEMINI_API_KEY", ""))
         model = st.selectbox("Gemini Model", ["gemini-2.5-flash", "gemini-2.5-pro"], index=0)
         ollama_base_url = None
-        ollama_api_key = None
-    elif provider == "Ollama Local":
-        ollama_base_url = st.text_input("Ollama Base URL", value="http://localhost:11434")
-        ollama_models = get_ollama_models(ollama_base_url)
-        if ollama_models:
-            saved_idx = 0
-            if "ollama_local_model" in st.session_state and st.session_state.ollama_local_model in ollama_models:
-                saved_idx = ollama_models.index(st.session_state.ollama_local_model)
-            model = st.selectbox("Ollama Model", ollama_models, index=saved_idx, key="ollama_local_model")
-        else:
-            model = ""
-            st.warning("No Ollama models found. Is Ollama running?")
-        api_key = None
         ollama_api_key = None
     else:
         ollama_base_url = "https://ollama.com"
@@ -225,7 +212,7 @@ if uploaded_files:
         if provider == "Google Gemini" and not api_key:
             logger.warning("Extraction blocked: no API key provided")
             st.error("Please enter your Gemini API Key in the sidebar.")
-        elif provider in ("Ollama Local", "Ollama Cloud") and not model:
+        elif provider == "Ollama Cloud" and not model:
             st.error("No Ollama models available.")
         else:
             st.session_state.results.clear()
