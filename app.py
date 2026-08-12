@@ -2,6 +2,7 @@ import json
 import io
 import time
 import logging
+import base64
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -9,6 +10,8 @@ from google import genai
 from google.genai import types
 from rapidfuzz import process, utils
 from dotenv import load_dotenv
+import ollama
+import requests
 import os
 
 load_dotenv()
@@ -40,6 +43,16 @@ COMPANY_MAPPING = {
 
 KNOWN_COMPANIES = ["alliance", "BLUE SKY", "cairo express", "coral", "JOIS", "masters", "sun"]
 
+EXTRACTION_PROMPT = """
+Analyze this handwritten note carefully. It contains list entries organized under dates (e.g., 29-7, 30-7).
+Extract each line item into a structured list with these exact keys:
+1. "date": The section header date (e.g., "29-7", "30-7").
+2. "reference": The code or alphanumeric reference string on the left side (e.g., "2605NLRRJ6H3", "369701", "BP4Yj").
+3. "company": The text on the right side if present (e.g., "مع رضا", "المصري", "sun", "Masters"). If blank, use null.
+
+Respond STRICTLY with a valid JSON array of objects. No markdown, no explanation.
+"""
+
 
 def normalize_company(raw_text: str) -> str:
     if not raw_text:
@@ -55,39 +68,7 @@ def normalize_company(raw_text: str) -> str:
     return raw_text
 
 
-def process_image(image: Image.Image, api_key: str, model: str = "gemini-2.5-flash"):
-    logger.info("Starting extraction | model=%s | image_size=%sx%s", model, image.width, image.height)
-    start = time.time()
-    try:
-        client = genai.Client(api_key=api_key)
-        prompt = """
-        Analyze this handwritten note carefully. It contains list entries organized under dates (e.g., 29-7, 30-7).
-        Extract each line item into a structured list with these exact keys:
-        1. "date": The section header date (e.g., "29-7", "30-7").
-        2. "reference": The code or alphanumeric reference string on the left side (e.g., "2605NLRRJ6H3", "369701", "BP4Yj").
-        3. "company": The text on the right side if present (e.g., "مع رضا", " المصري", "sun", "Masters"). If blank, use null.
-
-        Respond STRICTLY with a valid JSON array of objects.
-        """
-        response = client.models.generate_content(
-            model=model,
-            contents=[image, prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
-        )
-        elapsed = time.time() - start
-        usage = getattr(response, "usage_metadata", None)
-        prompt_tokens = getattr(usage, "prompt_token_count", "?") if usage else "?"
-        completion_tokens = getattr(usage, "candidates_token_count", "?") if usage else "?"
-        logger.info(
-            "API response OK | model=%s | time=%.2fs | prompt_tokens=%s | completion_tokens=%s",
-            model, elapsed, prompt_tokens, completion_tokens,
-        )
-        raw_data = json.loads(response.text)
-        logger.info("Parsed %d records from response", len(raw_data))
-    except Exception as e:
-        elapsed = time.time() - start
-        logger.error("API call failed | model=%s | time=%.2fs | error=%s", model, elapsed, str(e))
-        raise
+def parse_to_dataframe(raw_data: list) -> pd.DataFrame:
     processed_records = []
     for item in raw_data:
         raw_company = item.get("company")
@@ -103,6 +84,86 @@ def process_image(image: Image.Image, api_key: str, model: str = "gemini-2.5-fla
     return pd.DataFrame(processed_records)
 
 
+def process_image_gemini(image: Image.Image, api_key: str, model: str = "gemini-2.5-flash"):
+    logger.info("Starting Gemini extraction | model=%s | image_size=%sx%s", model, image.width, image.height)
+    start = time.time()
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=[image, EXTRACTION_PROMPT],
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
+        )
+        elapsed = time.time() - start
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = getattr(usage, "prompt_token_count", "?") if usage else "?"
+        completion_tokens = getattr(usage, "candidates_token_count", "?") if usage else "?"
+        logger.info(
+            "Gemini response OK | model=%s | time=%.2fs | prompt_tokens=%s | completion_tokens=%s",
+            model, elapsed, prompt_tokens, completion_tokens,
+        )
+        raw_data = json.loads(response.text)
+        logger.info("Parsed %d records from Gemini response", len(raw_data))
+    except Exception as e:
+        elapsed = time.time() - start
+        logger.error("Gemini call failed | model=%s | time=%.2fs | error=%s", model, elapsed, str(e))
+        raise
+    return parse_to_dataframe(raw_data)
+
+
+def process_image_ollama(image: Image.Image, model: str, base_url: str = "http://localhost:11434",
+                         api_key: str | None = None):
+    logger.info("Starting Ollama extraction | model=%s | base_url=%s | image_size=%sx%s",
+                model, base_url, image.width, image.height)
+    start = time.time()
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        client = ollama.Client(host=base_url, headers=headers)
+        response = client.chat(
+            model=model,
+            messages=[
+                {"role": "user", "content": EXTRACTION_PROMPT, "images": [image_b64]},
+            ],
+            options={"temperature": 0.1},
+        )
+        elapsed = time.time() - start
+        content = response["message"]["content"]
+        logger.info("Ollama response OK | model=%s | time=%.2fs | response_length=%d",
+                    model, elapsed, len(content))
+        json_match = content
+        if "```json" in content:
+            json_match = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            json_match = content.split("```")[1].split("```")[0]
+        raw_data = json.loads(json_match.strip())
+        logger.info("Parsed %d records from Ollama response", len(raw_data))
+    except Exception as e:
+        elapsed = time.time() - start
+        logger.error("Ollama call failed | model=%s | time=%.2fs | error=%s", model, elapsed, str(e))
+        raise
+    return parse_to_dataframe(raw_data)
+
+
+def get_ollama_models(base_url: str = "http://localhost:11434", api_key: str | None = None) -> list[str]:
+    try:
+        if "ollama.com" in base_url:
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            resp = requests.get(f"{base_url}/api/tags", headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            return [m["name"] for m in data.get("models", [])]
+        else:
+            client = ollama.Client(host=base_url)
+            models = client.list()
+            return [m.model for m in models.models]
+    except Exception as e:
+        logger.error("Failed to fetch Ollama models | base_url=%s | error=%s", base_url, str(e))
+        return []
+
+
 def to_excel_buffer(df: pd.DataFrame, sheet_name: str = "References") -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -115,8 +176,40 @@ st.write("Upload one or more images of handwritten reference numbers. Extract, e
 
 with st.sidebar:
     st.header("Configuration")
-    api_key = st.text_input("Gemini API Key", type="password", value=os.getenv("GEMINI_API_KEY", ""))
-    model = st.selectbox("Model", ["gemini-2.5-flash", "gemini-2.5-pro"], index=0)
+    provider = st.radio("Provider", ["Google Gemini", "Ollama Local", "Ollama Cloud"], horizontal=True)
+
+    if provider == "Google Gemini":
+        api_key = st.text_input("Gemini API Key", type="password", value=os.getenv("GEMINI_API_KEY", ""))
+        model = st.selectbox("Gemini Model", ["gemini-2.5-flash", "gemini-2.5-pro"], index=0)
+        ollama_base_url = None
+        ollama_api_key = None
+    elif provider == "Ollama Local":
+        ollama_base_url = st.text_input("Ollama Base URL", value="http://localhost:11434")
+        ollama_models = get_ollama_models(ollama_base_url)
+        if ollama_models:
+            saved_idx = 0
+            if "ollama_local_model" in st.session_state and st.session_state.ollama_local_model in ollama_models:
+                saved_idx = ollama_models.index(st.session_state.ollama_local_model)
+            model = st.selectbox("Ollama Model", ollama_models, index=saved_idx, key="ollama_local_model")
+        else:
+            model = ""
+            st.warning("No Ollama models found. Is Ollama running?")
+        api_key = None
+        ollama_api_key = None
+    else:
+        ollama_base_url = "https://ollama.com"
+        ollama_api_key = st.text_input("Ollama API Key", type="password",
+                                       value=os.getenv("OLLAMA_API_KEY", "204e06089d064ab7b57ea61ca220731f.aBlDqS6bE-kVeMlUen98QQa1"))
+        ollama_models = get_ollama_models(ollama_base_url, ollama_api_key)
+        if ollama_models:
+            saved_idx = 0
+            if "ollama_cloud_model" in st.session_state and st.session_state.ollama_cloud_model in ollama_models:
+                saved_idx = ollama_models.index(st.session_state.ollama_cloud_model)
+            model = st.selectbox("Ollama Cloud Model", ollama_models, index=saved_idx, key="ollama_cloud_model")
+        else:
+            model = ""
+            st.warning("No cloud models found. Check your API key.")
+        api_key = None
 
 uploaded_files = st.file_uploader(
     "Upload Handwritten Images", type=["jpg", "jpeg", "png"], accept_multiple_files=True
@@ -124,15 +217,21 @@ uploaded_files = st.file_uploader(
 
 if "results" not in st.session_state:
     st.session_state.results = {}
+if "confirmed" not in st.session_state:
+    st.session_state.confirmed = {}
 
 if uploaded_files:
     if st.button("Extract All Images"):
-        if not api_key:
+        if provider == "Google Gemini" and not api_key:
             logger.warning("Extraction blocked: no API key provided")
             st.error("Please enter your Gemini API Key in the sidebar.")
+        elif provider in ("Ollama Local", "Ollama Cloud") and not model:
+            st.error("No Ollama models available.")
         else:
             st.session_state.results.clear()
-            logger.info("Batch extraction started | files=%d | model=%s", len(uploaded_files), model)
+            st.session_state.confirmed.clear()
+            logger.info("Batch extraction started | provider=%s | files=%d | model=%s",
+                        provider, len(uploaded_files), model)
             progress = st.progress(0, text="Starting extraction...")
             for i, uploaded in enumerate(uploaded_files):
                 progress.progress(
@@ -143,7 +242,10 @@ if uploaded_files:
                 image_bytes = uploaded.getvalue()
                 image = Image.open(uploaded)
                 try:
-                    df = process_image(image, api_key, model)
+                    if provider == "Google Gemini":
+                        df = process_image_gemini(image, api_key, model)
+                    else:
+                        df = process_image_ollama(image, model, ollama_base_url, ollama_api_key)
                     st.session_state.results[uploaded.name] = {"df": df, "image": image_bytes}
                     logger.info("Extraction OK | file=%s | rows=%d", uploaded.name, len(df))
                 except Exception as e:
@@ -158,63 +260,95 @@ if uploaded_files:
     if st.session_state.results:
         st.divider()
 
-        has_any = any(isinstance(v["df"], pd.DataFrame) for v in st.session_state.results.values())
-        if has_any:
-            merge_col1, merge_col2 = st.columns([1, 3])
-            with merge_col1:
-                selected = st.multiselect(
-                    "Select images to merge",
-                    options=[k for k, v in st.session_state.results.items() if isinstance(v["df"], pd.DataFrame)],
-                    default=[k for k, v in st.session_state.results.items() if isinstance(v["df"], pd.DataFrame)],
+        confirmed_names = [n for n, c in st.session_state.confirmed.items() if c]
+        total = len(st.session_state.results)
+        confirmed_count = len(confirmed_names)
+
+        if confirmed_count > 0:
+            st.subheader(f"Confirmed: {confirmed_count}/{total}")
+            merged = pd.concat(
+                [st.session_state.results[n]["df"] for n in confirmed_names], ignore_index=True
+            )
+            dl_col1, dl_col2, dl_col3 = st.columns(3)
+            with dl_col1:
+                st.download_button(
+                    label=f"Download All Confirmed Excel ({len(merged)} rows)",
+                    data=to_excel_buffer(merged),
+                    file_name="confirmed_references.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_all_confirmed_excel",
                 )
-            with merge_col2:
-                if selected:
-                    merged = pd.concat(
-                        [st.session_state.results[name]["df"] for name in selected], ignore_index=True
-                    )
-                    logger.info("Merged %d images | total_rows=%d", len(selected), len(merged))
-                    st.download_button(
-                        label=f"Download Merged Excel ({len(merged)} rows)",
-                        data=to_excel_buffer(merged),
-                        file_name="merged_references.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                    st.download_button(
-                        label=f"Download Merged CSV ({len(merged)} rows)",
-                        data=merged.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="merged_references.csv",
-                        mime="text/csv",
-                    )
+            with dl_col2:
+                st.download_button(
+                    label=f"Download All Confirmed CSV ({len(merged)} rows)",
+                    data=merged.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="confirmed_references.csv",
+                    mime="text/csv",
+                    key="dl_all_confirmed_csv",
+                )
+            with dl_col3:
+                if st.button("Clear All Results", key="clear_all"):
+                    logger.info("Clearing all results | count=%d", total)
+                    st.session_state.results.clear()
+                    st.session_state.confirmed.clear()
+                    st.rerun()
+        else:
+            if st.button("Clear All Results", key="clear_all"):
+                logger.info("Clearing all results | count=%d", total)
+                st.session_state.results.clear()
+                st.session_state.confirmed.clear()
+                st.rerun()
 
-        st.subheader("Per-Image Results")
+        st.subheader("Review Each Image")
 
-        for name, result in st.session_state.results.items():
-            with st.expander(name, expanded=True):
-                if isinstance(result["df"], str):
-                    st.error(result["df"])
-                else:
-                    st.subheader("Preview")
-                    st.image(result["image"], width=300)
-                    edited = st.data_editor(result["df"], num_rows="dynamic", key=f"editor_{name}")
-                    dl_col1, dl_col2 = st.columns(2)
-                    with dl_col1:
-                        st.download_button(
-                            label=f"Download {name} Excel",
-                            data=to_excel_buffer(edited),
-                            file_name=f"{os.path.splitext(name)[0]}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"dl_excel_{name}",
-                        )
-                    with dl_col2:
-                        st.download_button(
-                            label=f"Download {name} CSV",
-                            data=edited.to_csv(index=False).encode("utf-8-sig"),
-                            file_name=f"{os.path.splitext(name)[0]}.csv",
-                            mime="text/csv",
-                            key=f"dl_csv_{name}",
+        tabs = st.tabs(list(st.session_state.results.keys()))
+
+        for tab, (name, result) in zip(tabs, st.session_state.results.items()):
+            with tab:
+                col_img, col_data = st.columns([1, 1])
+
+                with col_img:
+                    st.subheader("Original Image")
+                    st.image(result["image"], use_container_width=True)
+
+                with col_data:
+                    st.subheader("Extracted Data")
+                    if isinstance(result["df"], str):
+                        st.error(result["df"])
+                    else:
+                        edited = st.data_editor(
+                            result["df"], num_rows="dynamic", key=f"editor_{name}"
                         )
 
-        if st.button("Clear All Results"):
-            logger.info("Clearing all results | count=%d", len(st.session_state.results))
-            st.session_state.results.clear()
-            st.rerun()
+                        btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+                        with btn_col1:
+                            if st.button("Save Edits", key=f"save_{name}"):
+                                st.session_state.results[name]["df"] = edited
+                                st.session_state.confirmed[name] = True
+                                logger.info("Edits saved & confirmed | file=%s | rows=%d", name, len(edited))
+                                st.rerun()
+
+                        with btn_col2:
+                            if st.button("Re-extract", key=f"reextract_{name}"):
+                                image_bytes = st.session_state.results[name]["image"]
+                                image = Image.open(io.BytesIO(image_bytes))
+                                try:
+                                    if provider == "Google Gemini":
+                                        new_df = process_image_gemini(image, api_key, model)
+                                    else:
+                                        new_df = process_image_ollama(image, model, ollama_base_url, ollama_api_key)
+                                    st.session_state.results[name]["df"] = new_df
+                                    st.session_state.confirmed[name] = False
+                                    logger.info("Re-extraction OK | file=%s | rows=%d", name, len(new_df))
+                                except Exception as e:
+                                    st.error(f"Re-extraction failed: {e}")
+                                    logger.error("Re-extraction FAILED | file=%s | error=%s", name, str(e))
+                                st.rerun()
+
+                        with btn_col3:
+                            is_confirmed = st.session_state.confirmed.get(name, False)
+                            if is_confirmed:
+                                st.success("Confirmed")
+                            else:
+                                st.warning("Pending")
